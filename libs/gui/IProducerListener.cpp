@@ -233,6 +233,16 @@ bool BnProducerListener::needsReleaseNotify() {
 void BnProducerListener::onBuffersDiscarded(const std::vector<int32_t>& /*discardedSlots*/) {
 }
 
+// Keep exporting BnProducerListener::onBufferDetached(int) for vendor libraries built
+// against the older libgui ABI. ProducerListener::onBufferDetached now also takes the
+// buffer ID, and a member with the old signature would hide it, so define the old
+// symbol as a free function with the same calling convention instead.
+extern "C" __attribute__((visibility("default"))) void BnProducerListener_onBufferDetachedCompat(
+        BnProducerListener* /*self*/, int /*slot*/)
+        __asm__("_ZN7android18BnProducerListener16onBufferDetachedEi");
+extern "C" void BnProducerListener_onBufferDetachedCompat(BnProducerListener* /*self*/,
+                                                          int /*slot*/) {}
+
 #if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
 bool BnProducerListener::needsAttachNotify() {
     return true;
