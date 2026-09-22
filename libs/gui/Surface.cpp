@@ -219,10 +219,10 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
     mSurfaceControlHandle = surfaceControlHandle;
 
     #ifdef MTK_GED_KPI
+    mPid = getpid();
+    mIsSurfaceFlinger = false;
     if (ged_fd == -1 && doMtkGedKpi == 1) {
-        ALOGE("Opening ged");
-        ged_fd = open("/proc/ged", O_RDONLY);
-        ALOGE("Opening ged ret = %d", ged_fd);
+        ged_fd = open("/proc/ged", O_RDONLY | O_CLOEXEC);
         {
         struct GED_BRIDGE_IN_GPU_TIMESTAMP in = {
             .pid = 0,
@@ -235,6 +235,7 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
         };
         struct GED_BRIDGE_OUT_GPU_TIMESTAMP out;
         memset(&in, 0, sizeof(in));
+        memset(&out, 0, sizeof(out));
         GED_BRIDGE_PACKAGE package = {
             .ui32FunctionID = GED_BRIDGE_IO_GPU_TIMESTAMP,
             .i32Size = sizeof(GED_BRIDGE_PACKAGE),
@@ -245,13 +246,17 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
         };
         if (ged_fd >= 0) {
             int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
-            ALOGE("First null timestamp ioctl returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
-            if (out.is_ged_kpi_enabled != 1) {
-                ALOGE("is_ged_kpi_enabled reported disabled");
+            ALOGI("GED KPI probe returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
+            if (ret < 0 || out.is_ged_kpi_enabled != 1) {
+                // Every per-frame call is gated on ged_fd, so close it.
+                ALOGI("GED KPI disabled");
+                close(ged_fd);
+                ged_fd = -1;
                 doMtkGedKpi = 0;
             }
         } else {
-            ALOGE("No /proc/ged");
+            ALOGI("No /proc/ged");
+            doMtkGedKpi = 0;
         }
         }
     }
@@ -1482,7 +1487,7 @@ void Surface::onBufferQueuedLocked(int slot, sp<Fence> fence,
                 .i32Size = sizeof(GED_BRIDGE_PACKAGE),
                 .pvParamIn = &in,
                 .i32InBufferSize = sizeof(in),
-                .pvParamOut = &in,
+                .pvParamOut = &out,
                 .i32OutBufferSize = sizeof(out),
             };
             int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
@@ -2377,18 +2382,19 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             : (ipc != nullptr)?ipc->getCallingPid():-1;
 
         // We've got caller PID. Now checking whether it is surfaceflinger
-        char cmdline[128];
+        char cmdline[128] = {};
         char path[128];
         snprintf(path, sizeof(path)-1, "/proc/%d/cmdline", mPid);
-        int fd = open(path, O_RDONLY);
-        read(fd, cmdline, sizeof(cmdline)-1);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            read(fd, cmdline, sizeof(cmdline)-1);
+            close(fd);
+        }
         // Normally cmdline is already \0-separated, but well
         for(unsigned i=0; i<sizeof(cmdline); i++)
             if(cmdline[i] == '\n')
                 cmdline[i] = 0;
         cmdline[sizeof(cmdline)-1] = 0;
-
-        close(fd);
 
         // Truncate to last / (also called basename)
         const char *c = strrchr(cmdline, '/');
@@ -2398,10 +2404,8 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             c = cmdline;
         }
         if(strcmp(c, "surfaceflinger") == 0) {
-            ALOGE("is surfaceflinger = 1");
             mIsSurfaceFlinger = true;
         } else {
-            ALOGE("is surfaceflinger = 0");
             mIsSurfaceFlinger = false;
         }
     }
