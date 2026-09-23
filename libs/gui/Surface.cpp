@@ -160,6 +160,9 @@ static int gedKpiFd() {
         GED_BRIDGE_OUT_GPU_TIMESTAMP out;
         memset(&in, 0, sizeof(in));
         memset(&out, 0, sizeof(out));
+        // No fence: the kernel resolves fence_fd in this process, and fd 0
+        // may be a real sync file here.
+        in.fence_fd = -1;
         GED_BRIDGE_PACKAGE package = {
             .ui32FunctionID = GED_BRIDGE_IO_GPU_TIMESTAMP,
             .i32Size = sizeof(GED_BRIDGE_PACKAGE),
