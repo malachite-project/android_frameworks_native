@@ -318,6 +318,20 @@ void filterHdrTypes(const std::vector<ui::Hdr>& displayHdrTypes, ui::DisplayMode
     }
 }
 
+// Some devices decode Dolby Vision into frames the panel shows as ordinary HDR,
+// so their composer never reports it. They set this property with the decoder.
+void addDolbyVisionIfDecoded(HdrCapabilities& capabilities) {
+    if (!base::GetBoolProperty("ro.surface_flinger.has_dolby_vision"s, false) ||
+        contains(capabilities.getSupportedHdrTypes(), ui::Hdr::DOLBY_VISION)) {
+        return;
+    }
+    std::vector<ui::Hdr> types = capabilities.getSupportedHdrTypes();
+    types.push_back(ui::Hdr::DOLBY_VISION);
+    capabilities = HdrCapabilities(types, capabilities.getDesiredMaxLuminance(),
+                                   capabilities.getDesiredMaxAverageLuminance(),
+                                   capabilities.getDesiredMinLuminance());
+}
+
 HdrCapabilities filterOut4k30(const HdrCapabilities& displayHdrCapabilities) {
     std::vector<ui::Hdr> hdrTypes;
     for (ui::Hdr type : displayHdrCapabilities.getSupportedHdrTypes()) {
@@ -4217,6 +4231,9 @@ sp<DisplayDevice> SurfaceFlinger::setupNewDisplayDeviceInternal(
     if (const auto id = compositionDisplay->getDisplayIdVariant().and_then(
                 asHalDisplayId<DisplayIdVariant>)) {
         getHwComposer().getHdrCapabilities(*id, &creationArgs.hdrCapabilities);
+        if (creationArgs.isPrimary) {
+            addDolbyVisionIfDecoded(creationArgs.hdrCapabilities);
+        }
         creationArgs.supportedPerFrameMetadata = getHwComposer().getSupportedPerFrameMetadata(*id);
     }
 
