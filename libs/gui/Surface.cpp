@@ -294,11 +294,12 @@ static int fpsgoFd() {
     return sFpsgoRefused.load(std::memory_order_relaxed) ? -1 : fd;
 }
 
-static void fpsgoSend(unsigned long cmd, uint32_t start, uint64_t id, int32_t queueSF = 0) {
+static void fpsgoSend(unsigned long cmd, uint32_t start, uint64_t id, int32_t queueSF = 0,
+                      pid_t tid = gettid()) {
     const int fd = fpsgoFd();
     if (fd < 0) return;
     FpsgoPackage package = {};
-    package.tid = static_cast<uint32_t>(gettid());
+    package.tid = static_cast<uint32_t>(tid);
     package.start = start;
     package.bufID = id;
     package.queueSF = queueSF;
@@ -310,14 +311,18 @@ static void fpsgoSend(unsigned long cmd, uint32_t start, uint64_t id, int32_t qu
 }
 
 // FPSGO pairs the buffer ID with the queue before it accepts the connection.
+// The pair is keyed by thread group, but FPSGO drops it once the pid it was
+// added with is gone (fpsgo_check_BQid_status), so add it with the process's
+// pid rather than the connecting thread's, which may exit while another
+// thread keeps queueing.
 static void fpsgoConnect(uint64_t id, int api, bool queuesToComposer) {
-    fpsgoSend(kFpsgoBqid, 1, id, queuesToComposer ? 1 : 0);
+    fpsgoSend(kFpsgoBqid, 1, id, queuesToComposer ? 1 : 0, getpid());
     fpsgoSend(kFpsgoQueueConnect, static_cast<uint32_t>(api), id);
 }
 
 static void fpsgoDisconnect(uint64_t id) {
     fpsgoSend(kFpsgoQueueConnect, kFpsgoDisconnect, id);
-    fpsgoSend(kFpsgoBqid, 0, id);
+    fpsgoSend(kFpsgoBqid, 0, id, 0, getpid());
 }
 
 // Reports the start of a dequeue or queue now and its end when it goes out of
