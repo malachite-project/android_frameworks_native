@@ -34,6 +34,7 @@
 #ifdef MTK_FPSGO
 #include <errno.h>
 #include <string.h>
+#include <atomic>
 #endif
 #ifdef MTK_GED_KPI
 #include <unordered_map>
@@ -275,27 +276,37 @@ constexpr unsigned long kFpsgoQueueConnect = _IOW('g', 15, FpsgoPackage);
 constexpr unsigned long kFpsgoBqid = _IOW('g', 16, FpsgoPackage);
 constexpr uint32_t kFpsgoDisconnect = 0;
 
-// Opened once per process and never closed; -1 when FPSGO is missing or the
-// process may not use it.
+// Set once an event is refused for good (the process may open the node but
+// not issue these ioctls, as some vendor domains, or the kernel does not know
+// the command), so a refused process stops instead of failing every frame.
+static std::atomic<bool> sFpsgoRefused = false;
+
+// Opened once per process and never closed; -1 when FPSGO is missing, the
+// process may not use it, or it refused an event.
 static int fpsgoFd() {
     static const int fd = [] {
-        int fd = open("/proc/perfmgr/perf_ioctl", O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
+        int ret = open("/proc/perfmgr/perf_ioctl", O_RDONLY | O_CLOEXEC);
+        if (ret < 0) {
             ALOGV("No FPSGO: %s", strerror(errno));
         }
-        return fd;
+        return ret;
     }();
-    return fd;
+    return sFpsgoRefused.load(std::memory_order_relaxed) ? -1 : fd;
 }
 
 static void fpsgoSend(unsigned long cmd, uint32_t start, uint64_t id, int32_t queueSF = 0) {
+    const int fd = fpsgoFd();
+    if (fd < 0) return;
     FpsgoPackage package = {};
     package.tid = static_cast<uint32_t>(gettid());
     package.start = start;
     package.bufID = id;
     package.queueSF = queueSF;
     package.identifier = id;
-    ioctl(fpsgoFd(), cmd, &package);
+    if (ioctl(fd, cmd, &package) < 0 && (errno == EACCES || errno == EPERM || errno == ENOTTY)) {
+        ALOGI("FPSGO refused event %lx: %s; not sending more", cmd, strerror(errno));
+        sFpsgoRefused.store(true, std::memory_order_relaxed);
+    }
 }
 
 // FPSGO pairs the buffer ID with the queue before it accepts the connection.
@@ -1613,8 +1624,8 @@ int Surface::queueBuffer(sp<GraphicBuffer>&& buffer, int fenceFd,
     ATRACE_CALL();
     SURF_LOGV("Surface::queueBuffer");
 #ifdef MTK_FPSGO
-    uint64_t fpsgoId;
-    {
+    uint64_t fpsgoId = 0;
+    if (fpsgoFd() >= 0) {
         std::scoped_lock _dl(mDebugMutex);
         fpsgoId = mId;
     }
