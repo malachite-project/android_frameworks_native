@@ -26,10 +26,16 @@
 #include <deque>
 #include <mutex>
 #include <thread>
-#ifdef MTK_GED_KPI
+#if defined(MTK_GED_KPI) || defined(MTK_FPSGO)
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+#ifdef MTK_FPSGO
+#include <errno.h>
+#include <string.h>
+#endif
+#ifdef MTK_GED_KPI
 #include <unordered_map>
 #endif
 
@@ -245,6 +251,84 @@ static void gedKpiTimestamp(int gedFd, const GedKpiOwner& owner, uint64_t wnd,
     ALOGV("GPU timestamp ioctl returned %d %d %d %d", ret, out.eError, in.i32FrameID,
           queuedLength);
 }
+#endif
+
+#ifdef MTK_FPSGO
+// MediaTek's FPSGO (fpsgo.ko behind /proc/perfmgr/perf_ioctl) only learns about
+// a producer from these BufferQueue events, which MediaTek's libgui sends from
+// every producer process; the vendor policy grants apps, surfaceflinger,
+// cameraserver and others exactly these ioctls. FPSGO measures each queue's
+// frame rate and, for the producers it controls, hands it to GED, whose
+// frame-based GPU DVFS otherwise sizes every frame against the panel refresh
+// period. Layout and numbers: perf_ioctl.h in MediaTek's kernel modules.
+struct FpsgoPackage {
+    uint32_t tid;
+    uint32_t start;      // also the connected API for FPSGO_QUEUE_CONNECT
+    uint64_t bufID;      // the GED KPI window ID, so FPSGO's target reaches GED
+    uint64_t frameId;
+    int32_t queueSF;
+    uint64_t identifier;
+};
+static_assert(sizeof(FpsgoPackage) == 40, "must match the kernel's _FPSGO_PACKAGE");
+
+constexpr unsigned long kFpsgoQueue = _IOW('g', 1, FpsgoPackage);
+constexpr unsigned long kFpsgoDequeue = _IOW('g', 3, FpsgoPackage);
+constexpr unsigned long kFpsgoQueueConnect = _IOW('g', 15, FpsgoPackage);
+constexpr unsigned long kFpsgoBqid = _IOW('g', 16, FpsgoPackage);
+constexpr uint32_t kFpsgoDisconnect = 0;
+
+// Opened once per process and never closed; -1 when FPSGO is missing or the
+// process may not use it.
+static int fpsgoFd() {
+    static const int fd = [] {
+        int fd = open("/proc/perfmgr/perf_ioctl", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            ALOGV("No FPSGO: %s", strerror(errno));
+        }
+        return fd;
+    }();
+    return fd;
+}
+
+static void fpsgoSend(unsigned long cmd, uint32_t start, uint64_t id, int32_t queueSF = 0) {
+    FpsgoPackage package = {};
+    package.tid = static_cast<uint32_t>(gettid());
+    package.start = start;
+    package.bufID = id;
+    package.queueSF = queueSF;
+    package.identifier = id;
+    ioctl(fpsgoFd(), cmd, &package);
+}
+
+// FPSGO pairs the buffer ID with the queue before it accepts the connection.
+static void fpsgoConnect(uint64_t id, int api, bool queuesToComposer) {
+    fpsgoSend(kFpsgoBqid, 1, id, queuesToComposer ? 1 : 0);
+    fpsgoSend(kFpsgoQueueConnect, static_cast<uint32_t>(api), id);
+}
+
+static void fpsgoDisconnect(uint64_t id) {
+    fpsgoSend(kFpsgoQueueConnect, kFpsgoDisconnect, id);
+    fpsgoSend(kFpsgoBqid, 0, id);
+}
+
+// Reports the start of a dequeue or queue now and its end when it goes out of
+// scope. FPSGO times each frame from these and from the queue-to-queue period.
+class FpsgoFrameEvent {
+public:
+    FpsgoFrameEvent(unsigned long cmd, uint64_t id)
+          : mCmd(cmd), mId(fpsgoFd() >= 0 ? id : 0) {
+        if (mId != 0) fpsgoSend(mCmd, 1, mId);
+    }
+    ~FpsgoFrameEvent() {
+        if (mId != 0) fpsgoSend(mCmd, 0, mId);
+    }
+    FpsgoFrameEvent(const FpsgoFrameEvent&) = delete;
+    FpsgoFrameEvent& operator=(const FpsgoFrameEvent&) = delete;
+
+private:
+    const unsigned long mCmd;
+    const uint64_t mId;
+};
 #endif
 
 Surface::ProducerDeathListenerProxy::ProducerDeathListenerProxy(
@@ -898,10 +982,19 @@ void Surface::getDequeueBufferInputLocked(
 }
 
 int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
+#ifdef MTK_FPSGO
+    uint64_t fpsgoId;
+#endif
     {
         std::scoped_lock _dl(mDebugMutex);
         ATRACE_FORMAT("dequeueBuffer - %s", mDebugName.c_str());
+#ifdef MTK_FPSGO
+        fpsgoId = mId;
+#endif
     }
+#ifdef MTK_FPSGO
+    FpsgoFrameEvent fpsgoDequeue(kFpsgoDequeue, fpsgoId);
+#endif
     SURF_LOGV("Surface::dequeueBuffer");
 
     IGraphicBufferProducer::DequeueBufferInput dqInput;
@@ -1495,6 +1588,15 @@ status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fenc
     if (buffer == nullptr) {
         return BAD_VALUE;
     }
+#ifdef MTK_FPSGO
+    uint64_t fpsgoId;
+    {
+        std::scoped_lock _dl(mDebugMutex);
+        fpsgoId = mId;
+    }
+    // Every queue path (ANativeWindow, sp<GraphicBuffer>) ends here on Android 17.
+    FpsgoFrameEvent fpsgoQueue(kFpsgoQueue, fpsgoId);
+#endif
 
     IGraphicBufferProducer::QueueBufferOutput igbpOutput;
     IGraphicBufferProducer::QueueBufferInput igbpInput;
@@ -2603,6 +2705,24 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
     }
 #endif
 
+#ifdef MTK_FPSGO
+    if (!err && fpsgoFd() >= 0) {
+        uint64_t id;
+        {
+            std::scoped_lock _dl(mDebugMutex);
+            id = mId;
+        }
+        // Asked of the producer directly: Surface::query takes mMutex. BLAST
+        // queues answer 1; queues to ImageReader or codecs fail the query.
+        int queuesToComposer = 0;
+        if (mGraphicBufferProducer->query(NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER,
+                                          &queuesToComposer) != NO_ERROR) {
+            queuesToComposer = 0;
+        }
+        if (id != 0) fpsgoConnect(id, api, queuesToComposer != 0);
+    }
+#endif
+
     if (!err && api == NATIVE_WINDOW_API_CPU) {
         mConnectedToCpu = true;
         // Clear the dirty region in case we're switching from a non-CPU API
@@ -2618,6 +2738,13 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
 int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
     ATRACE_CALL();
     SURF_LOGV("Surface::disconnect");
+#ifdef MTK_FPSGO
+    uint64_t fpsgoId;
+    {
+        std::scoped_lock _dl(mDebugMutex);
+        fpsgoId = mId;
+    }
+#endif
     int err = mGraphicBufferProducer->disconnect(api, mode);
     if (err == BAD_VALUE) {
         SURF_LOGE("Surface failed to disconnect with error %d (%s). Likely the wrong API was "
@@ -2625,6 +2752,9 @@ int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
                   err, statusToString(err).c_str(), api);
         return err;
     }
+#ifdef MTK_FPSGO
+    if (fpsgoId != 0 && fpsgoFd() >= 0) fpsgoDisconnect(fpsgoId);
+#endif
 
     // In this case the surface is either already disconnected or the process is dead.
     SURF_LOGE_IF(err != NO_ERROR,
