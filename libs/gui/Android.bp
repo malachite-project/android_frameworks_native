@@ -413,6 +413,9 @@ cc_defaults {
     ] + select(soong_config_variable("libgui", "support_mtk_ged_kpi"), {
         true: ["-DMTK_GED_KPI"],
         default: [],
+    }) + select(soong_config_variable("libgui", "support_mtk_fpsgo"), {
+        true: ["-DMTK_FPSGO"],
+        default: [],
     }),
 }
 
