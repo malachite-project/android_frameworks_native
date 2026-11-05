@@ -1018,9 +1018,10 @@ compositionengine::OutputLayer* Output::findLayerRequestingBackgroundComposition
             return nullptr;
         }
 
-        // If RenderEngine cannot render protected content, we cannot blur.
-        if (compState->hasProtectedContent &&
-            !getCompositionEngine().getRenderEngine().supportsProtectedContent()) {
+        // Blurring protected content forces it through RenderEngine in protected mode, which
+        // can hang the GPU and stall every other client. Leave such layers on the HWC and skip
+        // the blur, as for sideband streams.
+        if (compState->hasProtectedContent) {
             return nullptr;
         }
         if (compState->isOpaque) {
@@ -1602,7 +1603,8 @@ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
             continue;
         }
 
-        disableBlursWholesale |= layerFEState->sidebandStream != nullptr;
+        disableBlursWholesale |=
+                layerFEState->sidebandStream != nullptr || layerFEState->hasProtectedContent;
         bool disableBlurForLayer = layer->getState().ignoreBlur || disableBlursWholesale;
 
         const bool clientComposition = layer->requiresClientComposition();
