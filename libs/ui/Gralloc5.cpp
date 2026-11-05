@@ -33,6 +33,7 @@
 #include <vndksupport/linker.h>
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -135,6 +136,24 @@ static const Gralloc5 &getInstance() {
         return Gralloc5{std::move(allocator), mapper};
     }();
     return instance;
+}
+
+// A mapper older than the platform does not know the newest types, and some log an error for
+// each failed query, so callers on hot paths check first.
+static bool isStandardMetadataGettable(AIMapper *mapper, StandardMetadataType type) {
+    const AIMapper_MetadataTypeDescription *descriptions = nullptr;
+    size_t count = 0;
+    if (mapper->v5.listSupportedMetadataTypes(&descriptions, &count) != AIMAPPER_ERROR_NONE) {
+        return true;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const AIMapper_MetadataType &metadataType = descriptions[i].metadataType;
+        if (metadataType.value == static_cast<int64_t>(type) &&
+            strcmp(metadataType.name, kStandardMetadataName) == 0) {
+            return descriptions[i].isGettable;
+        }
+    }
+    return false;
 }
 
 template <StandardMetadataType T>
@@ -1046,6 +1065,11 @@ status_t Gralloc5Mapper::getStride(buffer_handle_t bufferHandle, uint32_t *outSt
 
 status_t Gralloc5Mapper::getSmpte2094_50(
         buffer_handle_t bufferHandle, std::optional<std::vector<uint8_t>>* outSmpte2094_50) const {
+    static const bool gettable =
+            isStandardMetadataGettable(mMapper, StandardMetadataType::SMPTE2094_50);
+    if (!gettable) {
+        return UNKNOWN_TRANSACTION;
+    }
     auto value = getStandardMetadata<StandardMetadataType::SMPTE2094_50>(mMapper, bufferHandle);
     if (value.has_value()) {
         *outSmpte2094_50 = std::move(*value);
