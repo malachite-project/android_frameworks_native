@@ -1730,7 +1730,11 @@ GlobalSignals Scheduler::makeGlobalSignals(PhysicalDisplayId displayId) const {
                     .and_then([&](const auto& timer) REQUIRES(mPolicyLock) {
                         return mPolicy.displayPowerModes.get(displayId).transform(
                                 [&](const auto& powerMode) {
-                                    return powerMode != hal::PowerMode::ON ||
+                                    // AOD can last for hours, so like ON it only counts for
+                                    // the timer's length after a power mode change.
+                                    const bool aod = powerMode == hal::PowerMode::DOZE ||
+                                            powerMode == hal::PowerMode::DOZE_SUSPEND;
+                                    return (powerMode != hal::PowerMode::ON && !aod) ||
                                             timer.get() == TimerState::Reset;
                                 });
                     })
